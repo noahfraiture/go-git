@@ -285,6 +285,11 @@ func (w *Worktree) setHEADToBranch(branch plumbing.ReferenceName, commit plumbin
 	return w.r.Storer.SetReference(head)
 }
 
+// Repository returns the repository backing this worktree.
+func (w *Worktree) Repository() *Repository {
+	return w.r
+}
+
 // Reset the worktree to a specified state.
 func (w *Worktree) Reset(opts *ResetOptions) error {
 	start := time.Now()

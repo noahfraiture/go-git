@@ -714,6 +714,53 @@ func (s *RepositorySuite) TestPlainOpenTildePath() {
 	}
 }
 
+func (s *RepositorySuite) TestCreateWorktree() {
+	repoPath := s.T().TempDir()
+	r, err := PlainInit(repoPath, false)
+	s.NoError(err)
+
+	createCommit(s, r)
+
+	worktreeBase := s.T().TempDir()
+	worktreePath := filepath.Join(worktreeBase, "linked")
+
+	wt, err := r.CreateWorktree(worktreePath, &CheckoutOptions{})
+	s.NoError(err)
+	s.Equal(filepath.Clean(worktreePath), filepath.Clean(wt.Filesystem.Root()))
+
+	worktrees, err := r.Worktrees()
+	s.NoError(err)
+	s.Len(worktrees, 1)
+
+	opened, err := PlainOpen(worktreePath)
+	s.NoError(err)
+	s.NotNil(opened)
+}
+
+func (s *RepositorySuite) TestDeleteWorktree() {
+	repoPath := s.T().TempDir()
+	r, err := PlainInit(repoPath, false)
+	s.NoError(err)
+
+	createCommit(s, r)
+
+	worktreeBase := s.T().TempDir()
+	worktreePath := filepath.Join(worktreeBase, "linked")
+
+	_, err = r.CreateWorktree(worktreePath, &CheckoutOptions{})
+	s.NoError(err)
+
+	s.NoError(r.DeleteWorktree(worktreePath))
+
+	worktrees, err := r.Worktrees()
+	s.NoError(err)
+	s.Len(worktrees, 0)
+
+	opened, err := PlainOpen(worktreePath)
+	s.ErrorIs(err, ErrRepositoryNotExists)
+	s.Nil(opened)
+}
+
 func (s *RepositorySuite) TestPlainOpenBare() {
 	dir := s.T().TempDir()
 	r, err := PlainInit(dir, true)

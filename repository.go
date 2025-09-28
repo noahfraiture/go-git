@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +55,9 @@ var (
 	ErrRemoteNotFound              = errors.New("remote not found")
 	ErrRemoteExists                = errors.New("remote already exists")
 	ErrAnonymousRemoteName         = errors.New("anonymous remote name must be 'anonymous'")
+	ErrRepositoryNotFileBased      = errors.New("repository storage must be file based")
+	ErrWorktreeAlreadyExists       = errors.New("worktree already exists")
+	ErrWorktreeNotExists           = errors.New("worktree does not exist")
 	ErrWorktreeNotProvided         = errors.New("worktree should be provided")
 	ErrIsBareRepository            = errors.New("worktree not available in a bare repository")
 	ErrUnableToResolveCommit       = errors.New("unable to resolve commit")
@@ -71,6 +75,23 @@ type Repository struct {
 
 	r  map[string]*Remote
 	wt billy.Filesystem
+}
+
+type filesystemStorer interface {
+	Filesystem() billy.Filesystem
+}
+
+type rootedFilesystem interface {
+	Root() string
+}
+
+func filesystemRoot(fs billy.Filesystem) (string, error) {
+	rooted, ok := fs.(rootedFilesystem)
+	if !ok {
+		return "", ErrRepositoryNotFileBased
+	}
+
+	return rooted.Root(), nil
 }
 
 type initOptions struct {
@@ -905,6 +926,299 @@ func (r *Repository) resolveToCommitHash(h plumbing.Hash) (plumbing.Hash, error)
 	default:
 		return plumbing.ZeroHash, ErrUnableToResolveCommit
 	}
+}
+
+// Worktrees returns all the linked working trees in a repository.
+func (r *Repository) Worktrees() ([]*Worktree, error) {
+	fsBased, ok := r.Storer.(filesystemStorer)
+	if !ok {
+		return nil, ErrRepositoryNotFileBased
+	}
+
+	repoFS := fsBased.Filesystem()
+	repoRoot, err := filesystemRoot(repoFS)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := repoFS.ReadDir("worktrees")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	worktrees := make([]*Worktree, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		gitdirRel := repoFS.Join("worktrees", entry.Name(), "gitdir")
+		f, err := repoFS.Open(gitdirRel)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		data, readErr := io.ReadAll(f)
+		closeErr := f.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+
+		gitdir := strings.TrimSpace(string(data))
+		if gitdir == "" {
+			continue
+		}
+
+		adminPath := filepath.Join(repoRoot, "worktrees", entry.Name())
+		if !filepath.IsAbs(gitdir) {
+			gitdir = filepath.Join(adminPath, gitdir)
+		}
+
+		worktreePath := filepath.Dir(gitdir)
+		wt, err := r.OpenWorktree(worktreePath)
+		if err != nil {
+			if errors.Is(err, ErrWorktreeNotExists) {
+				continue
+			}
+			return nil, err
+		}
+
+		worktrees = append(worktrees, wt)
+	}
+
+	return worktrees, nil
+}
+
+// CreateWorktree creates a linked working tree at the given path. The caller can
+// control the checked out reference via CheckoutOptions; when nil, defaults are
+// used.
+func (r *Repository) CreateWorktree(path string, opts *CheckoutOptions) (_ *Worktree, err error) {
+	fsBased, ok := r.Storer.(filesystemStorer)
+	if !ok {
+		return nil, ErrRepositoryNotFileBased
+	}
+
+	if opts == nil {
+		opts = &CheckoutOptions{}
+	}
+
+	path, err = path_util.ReplaceTildeWithHome(path)
+	if err != nil {
+		return nil, err
+	}
+
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := os.Stat(filepath.Join(path, GitDirName)); err == nil {
+		return nil, ErrWorktreeAlreadyExists
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, err
+	}
+
+	repoFS := fsBased.Filesystem()
+	baseName := filepath.Base(path)
+	if baseName == "" || baseName == string(filepath.Separator) || baseName == "." {
+		baseName = "worktree"
+	}
+
+	name := baseName
+	for i := 1; ; i++ {
+		gitdirRel := repoFS.Join("worktrees", name, "gitdir")
+		_, statErr := repoFS.Stat(gitdirRel)
+		if errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		if statErr != nil {
+			return nil, statErr
+		}
+		name = baseName + strconv.Itoa(i)
+	}
+
+	adminRel := repoFS.Join("worktrees", name)
+	if err := repoFS.MkdirAll(adminRel, 0o755); err != nil {
+		return nil, err
+	}
+
+	dot, err := repoFS.Chroot(adminRel)
+	if err != nil {
+		return nil, err
+	}
+
+	wtFS := osfs.New(path, osfs.WithBoundOS())
+
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(path)
+			dotRoot, rootErr := filesystemRoot(dot)
+			if rootErr == nil {
+				_ = os.RemoveAll(dotRoot)
+			}
+		}
+	}()
+
+	repositoryFS := dotgit.NewRepositoryFilesystem(dot, repoFS)
+	storer := filesystem.NewStorage(repositoryFS, cache.NewObjectLRUDefault())
+
+	worktree, err := newRepository(storer, wtFS).Worktree()
+	if err != nil {
+		return nil, err
+	}
+
+	if err = worktree.Checkout(opts); err != nil {
+		return nil, err
+	}
+
+	if err = createDotGitFile(wtFS, dot); err != nil {
+		return nil, err
+	}
+
+	if err = createDotGitWorktreeFiles(wtFS, dot, repoFS); err != nil {
+		return nil, err
+	}
+
+	cleanup = false
+	return worktree, nil
+}
+
+// DeleteWorktree deletes a linked working tree located at the given path.
+func (r *Repository) DeleteWorktree(path string) error {
+	worktree, err := r.OpenWorktree(path)
+	if err != nil {
+		return err
+	}
+
+	worktreeRoot, err := filesystemRoot(worktree.Filesystem)
+	if err != nil {
+		return err
+	}
+
+	if err := os.RemoveAll(worktreeRoot); err != nil {
+		return err
+	}
+
+	fsBased, ok := worktree.Repository().Storer.(filesystemStorer)
+	if !ok {
+		return ErrRepositoryNotFileBased
+	}
+
+	dotFS := fsBased.Filesystem()
+	dotRoot, err := filesystemRoot(dotFS)
+	if err != nil {
+		return err
+	}
+
+	return os.RemoveAll(dotRoot)
+}
+
+// OpenWorktree opens a linked working tree from the given path.
+func (r *Repository) OpenWorktree(path string) (*Worktree, error) {
+	fsBased, ok := r.Storer.(filesystemStorer)
+	if !ok {
+		return nil, ErrRepositoryNotFileBased
+	}
+
+	path, err := path_util.ReplaceTildeWithHome(path)
+	if err != nil {
+		return nil, err
+	}
+
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	wt := osfs.New(path, osfs.WithBoundOS())
+	dot, err := dotGitFileToOSFilesystem(path, wt)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrWorktreeNotExists
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	repoFS := fsBased.Filesystem()
+	repoRoot, err := filesystemRoot(repoFS)
+	if err != nil {
+		return nil, err
+	}
+
+	dotRoot, err := filesystemRoot(dot)
+	if err != nil {
+		return nil, err
+	}
+
+	worktreesRoot := filepath.Join(repoRoot, "worktrees") + string(os.PathSeparator)
+	dotRootClean := filepath.Clean(dotRoot) + string(os.PathSeparator)
+	if !strings.HasPrefix(dotRootClean, worktreesRoot) {
+		return nil, ErrWorktreeNotExists
+	}
+
+	if _, err := dot.Stat("gitdir"); errors.Is(err, os.ErrNotExist) {
+		return nil, ErrWorktreeNotExists
+	} else if err != nil {
+		return nil, err
+	}
+
+	repositoryFS := dotgit.NewRepositoryFilesystem(dot, repoFS)
+	storer := filesystem.NewStorage(repositoryFS, cache.NewObjectLRUDefault())
+
+	return newRepository(storer, wt).Worktree()
+}
+
+func createDotGitWorktreeFiles(worktree, storage, common billy.Filesystem) error {
+	storageRoot, err := filesystemRoot(storage)
+	if err != nil {
+		return err
+	}
+
+	commonRoot, err := filesystemRoot(common)
+	if err != nil {
+		return err
+	}
+
+	commondir, err := filepath.Rel(storageRoot, commonRoot)
+	if err != nil {
+		commondir = commonRoot
+	}
+
+	if err := writeSingleLine(storage, "commondir", commondir); err != nil {
+		return err
+	}
+
+	worktreeRoot, err := filesystemRoot(worktree)
+	if err != nil {
+		return err
+	}
+
+	return writeSingleLine(storage, "gitdir", filepath.Join(worktreeRoot, GitDirName))
+}
+
+func writeSingleLine(fs billy.Filesystem, filename, value string) (err error) {
+	f, err := fs.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer ioutil.CheckClose(f, &err)
+
+	_, err = fmt.Fprintln(f, value)
+	return err
 }
 
 // Clone clones a remote repository

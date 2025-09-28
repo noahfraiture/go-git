@@ -121,7 +121,7 @@ compatibility status with go-git.
 | ---------- | ----------- | ----------- | ----- | -------- |
 | `notes`    |             | ❌          |       |          |
 | `replace`  |             | ❌          |       |          |
-| `worktree` |             | ❌          |       |          |
+| `worktree` |             | ✅          |       |          |
 | `annotate` |             | (see blame) |       |          |
 
 ## GPG
@@ -231,4 +231,4 @@ compatibility status with go-git.
 | `config`        | `--global` <br/> `--system` | ✅     | Read-only.                                     |          |
 | `gitignore`     |                             | ✅     |                                                |          |
 | `gitattributes` |                             | ✅     |                                                |          |
-| `git-worktree`  |                             | ❌     | Multiple worktrees are not supported.          |          |
+| `git-worktree`  |                             | ✅     | Multiple worktrees are supported.              |          |
